@@ -82,9 +82,9 @@ class PalletPoseCNN(nn.Module):
         # and then use modulo to wrap them into [0, π] range
         # This avoids sigmoid saturation issues
         out_orient_raw = out[:, 2:3]
-        out_orient = torch.sigmoid(out_orient_raw) * np.pi
+        # out_orient = torch.tanh(out_orient_raw) * (np.pi / 2.0) + (np.pi / 2.0)
 
-        return torch.cat([out_pos, out_orient], dim=1)
+        return torch.cat([out_pos, out_orient_raw], dim=1)
 
 
 def main():
@@ -117,7 +117,7 @@ def main():
 
     model = PalletPoseCNN().to(device)
 
-    # Try to load existing model and continue training
+    # # Try to load existing model and continue training
     # try:
     #     model.load_state_dict(torch.load("pallet_pose_cnn.pth"))
     #     print("Loaded existing model, continuing training...")
@@ -132,7 +132,7 @@ def main():
     position_criterion = nn.MSELoss()
     orient_criterion = nn.MSELoss()
     batch_size = 512
-    num_epochs = 15
+    num_epochs = 100
 
     print(f"Training on {device}, N={N} samples")
 
@@ -168,8 +168,8 @@ def main():
             true_pos = batch_tgt[:, :2]  # x, y
             true_angle = batch_tgt[:, 2]  # theta
 
-            print(f"pred_angle: {pred_angle}")
-            print(f"true_angle: {true_angle}")
+            # print(f"pred_angle: {pred_angle}")
+            # print(f"true_angle: {true_angle}")
 
             # Calculate losses
             pos_loss = position_criterion(pred_pos, true_pos) / LIDAR_MAX_RANGE_MM
@@ -177,8 +177,8 @@ def main():
 
             # Combine losses with balanced scaling
             # Use pre-calculated scaling factor
-            # total_loss = pos_loss + degree_to_mm_scale * orient_loss
-            total_loss = orient_loss
+            total_loss = pos_loss + orient_loss
+            # total_loss = orient_loss
 
             optimizer.zero_grad()
             total_loss.backward()

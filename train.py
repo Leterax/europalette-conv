@@ -30,11 +30,11 @@ def pallet_orientation_loss(pred_angles, true_angles):
     # For angles in [0, π], we need to handle wraparound at the boundaries
     # Since pallets are symmetric, angles near 0 and π represent similar orientations
     abs_diff = torch.abs(diff)
-    
+
     # Handle wraparound: if |diff| > π/2, use π - |diff| instead
     # This accounts for the symmetry where 0° and 180° are equivalent for pallets
-    wrapped_diff = torch.where(abs_diff > np.pi/2, np.pi - abs_diff, abs_diff)
-    
+    wrapped_diff = torch.where(abs_diff > np.pi / 2, np.pi - abs_diff, abs_diff)
+
     # Return mean squared error
     return torch.mean(wrapped_diff**2)
 
@@ -77,7 +77,7 @@ class PalletPoseCNN(nn.Module):
         # - No activation on position outputs (x, y) - let the network learn the appropriate range
         # - For orientation: use modulo to constrain to [0, π] range
         out_pos = out[:, :2]  # Position outputs (x, y)
-        
+
         # Use a different approach for orientation - let the network output raw values
         # and then use modulo to wrap them into [0, π] range
         # This avoids sigmoid saturation issues
@@ -109,32 +109,43 @@ def main():
         np.float32
     )
 
-    # 3) Move everything to GPU once
+    # 3) Split into train/validation (95%/5%)
+    N = len(lidars)
+    val_size = int(0.05 * N)
+
+    val_lidars = lidars[:val_size]
+    val_targets = targets[:val_size]
+    train_lidars = lidars[val_size:]
+    train_targets = targets[val_size:]
+
+    # 4) Move everything to GPU once
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    lidars_t = torch.from_numpy(lidars).to(device)  # shape (N, 200)
-    targets_t = torch.from_numpy(targets).to(device)  # shape (N, 3)
-    N = lidars_t.shape[0]
+    train_lidars_t = torch.from_numpy(train_lidars).to(device)
+    train_targets_t = torch.from_numpy(train_targets).to(device)
+    val_lidars_t = torch.from_numpy(val_lidars).to(device)
+    val_targets_t = torch.from_numpy(val_targets).to(device)
+
+    N_train = train_lidars_t.shape[0]
+    N_val = val_lidars_t.shape[0]
 
     model = PalletPoseCNN().to(device)
 
-    # # Try to load existing model and continue training
-    # try:
-    #     model.load_state_dict(torch.load("pallet_pose_cnn.pth"))
-    #     print("Loaded existing model, continuing training...")
-    # except FileNotFoundError:
-    #     print("No existing model found, starting fresh training...")
-
-    model.train()
+    # Try to load existing model and continue training
+    try:
+        model.load_state_dict(torch.load("pallet_pose_cnn.pth"))
+        print("Loaded existing model, continuing training...")
+    except FileNotFoundError:
+        print("No existing model found, starting fresh training...")
 
     # 5) Training setup
     optimizer = optim.Adam(model.parameters(), lr=1e-3)
-    scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=3)
+    scheduler = ReduceLROnPlateau(optimizer, mode="min", factor=0.5, patience=3)
     position_criterion = nn.MSELoss()
     orient_criterion = nn.MSELoss()
     batch_size = 512
     num_epochs = 100
 
-    print(f"Training on {device}, N={N} samples")
+    print(f"Training on {device}, N_train={N_train}, N_val={N_val} samples")
 
     # Calculate and print the loss scaling factor
     degree_to_mm_scale = (100.0 / LIDAR_MAX_RANGE_MM) / (np.pi / 180.0)
@@ -142,18 +153,19 @@ def main():
         f"Loss scaling: 1 degree = 100mm, orientation loss scale factor = {degree_to_mm_scale:.4f}"
     )
 
-    # 6) Training loop (with noise augmentation)
+    # 6) Training loop (with validation)
     for epoch in range(1, num_epochs + 1):
+        # Training phase
         model.train()
-        perm = torch.randperm(N, device=device)
+        perm = torch.randperm(N_train, device=device)
         running_pos_loss = 0.0
         running_orient_loss = 0.0
         running_total_loss = 0.0
 
-        for i in range(0, N, batch_size):
+        for i in range(0, N_train, batch_size):
             idx = perm[i : i + batch_size]
-            batch_in = lidars_t[idx]
-            batch_tgt = targets_t[idx]
+            batch_in = train_lidars_t[idx]
+            batch_tgt = train_targets_t[idx]
 
             # --- Data augmentation: small Gaussian noise on the ranges ---
             # noise = 0.01 * torch.randn_like(batch_in)
@@ -168,17 +180,12 @@ def main():
             true_pos = batch_tgt[:, :2]  # x, y
             true_angle = batch_tgt[:, 2]  # theta
 
-            # print(f"pred_angle: {pred_angle}")
-            # print(f"true_angle: {true_angle}")
-
             # Calculate losses
             pos_loss = position_criterion(pred_pos, true_pos) / LIDAR_MAX_RANGE_MM
             orient_loss = orient_criterion(pred_angle, true_angle)
 
             # Combine losses with balanced scaling
-            # Use pre-calculated scaling factor
             total_loss = pos_loss + orient_loss
-            # total_loss = orient_loss
 
             optimizer.zero_grad()
             total_loss.backward()
@@ -188,23 +195,58 @@ def main():
             running_orient_loss += orient_loss.item() * batch_in.size(0)
             running_total_loss += total_loss.item() * batch_in.size(0)
 
-        avg_pos_loss = running_pos_loss / N
-        avg_orient_loss = running_orient_loss / N
-        avg_total_loss = running_total_loss / N
+        # Training metrics
+        train_pos_loss = running_pos_loss / N_train
+        train_orient_loss = running_orient_loss / N_train
+        train_total_loss = running_total_loss / N_train
+
+        # Validation phase
+        model.eval()
+        val_pos_loss = 0.0
+        val_orient_loss = 0.0
+        val_total_loss = 0.0
+
+        with torch.no_grad():
+            for i in range(0, N_val, batch_size):
+                batch_in = val_lidars_t[i : i + batch_size]
+                batch_tgt = val_targets_t[i : i + batch_size]
+
+                pred = model(batch_in)
+                pred_pos = pred[:, :2]
+                pred_angle = pred[:, 2]
+                true_pos = batch_tgt[:, :2]
+                true_angle = batch_tgt[:, 2]
+
+                pos_loss = position_criterion(pred_pos, true_pos) / LIDAR_MAX_RANGE_MM
+                orient_loss = orient_criterion(pred_angle, true_angle)
+                total_loss = pos_loss + orient_loss
+
+                val_pos_loss += pos_loss.item() * batch_in.size(0)
+                val_orient_loss += orient_loss.item() * batch_in.size(0)
+                val_total_loss += total_loss.item() * batch_in.size(0)
+
+        val_pos_loss /= N_val
+        val_orient_loss /= N_val
+        val_total_loss /= N_val
 
         # Convert losses to interpretable units
-        pos_accuracy_mm = avg_pos_loss * LIDAR_MAX_RANGE_MM
-        orient_accuracy_deg = np.degrees(avg_orient_loss)
+        train_pos_mm = train_pos_loss * LIDAR_MAX_RANGE_MM
+        train_orient_deg = np.degrees(train_orient_loss)
+        val_pos_mm = val_pos_loss * LIDAR_MAX_RANGE_MM
+        val_orient_deg = np.degrees(val_orient_loss)
 
         # Get current learning rate for logging
-        current_lr = optimizer.param_groups[0]['lr']
+        current_lr = optimizer.param_groups[0]["lr"]
 
         print(
-            f"Epoch {epoch:02d}/{num_epochs} — Total: {avg_total_loss:.6f}, Pos: {avg_pos_loss:.6f} ({pos_accuracy_mm:.1f}mm), Orient: {avg_orient_loss:.6f} ({orient_accuracy_deg:.1f}°), LR: {current_lr:.2e}"
+            f"Epoch {epoch:02d}/{num_epochs} — "
+            f"Train: {train_total_loss:.6f} ({train_pos_mm:.1f}mm, {train_orient_deg:.1f}°) | "
+            f"Val: {val_total_loss:.6f} ({val_pos_mm:.1f}mm, {val_orient_deg:.1f}°) | "
+            f"LR: {current_lr:.2e}"
         )
 
-        # Step the scheduler with the total loss
-        scheduler.step(avg_total_loss)
+        # Step the scheduler with validation loss
+        scheduler.step(val_total_loss)
 
     # 7) Save the trained model
     torch.save(model.state_dict(), "pallet_pose_cnn.pth")
